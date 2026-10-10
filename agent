@@ -1,0 +1,1216 @@
+
+"""
+AI Agent Web Application
+Flask + LangGraph + Ollama
+
+Installation:
+    pip install Flask requests langgraph langchain-ollama langchain-core
+
+Lancement:
+    python app.py
+
+Interface:
+    http://127.0.0.1:5000
+
+Health check:
+    http://127.0.0.1:5000/health
+
+Modèle par défaut:
+    llama3.1
+
+Pour changer de modèle:
+    Windows PowerShell:
+        $env:OLLAMA_MODEL="llama3.1"
+
+    Linux/macOS:
+        export OLLAMA_MODEL="llama3.1"
+"""
+
+import ast
+import json
+import logging
+import math
+import operator
+import os
+import re
+
+import requests
+from flask import Flask, jsonify, render_template_string, request
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, START, END
+from typing import Annotated, Optional, TypedDict
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger("ai_agent")
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    "http://localhost:11434"
+).rstrip("/")
+
+MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+
+HOST = os.getenv("FLASK_HOST", "127.0.0.1")
+PORT = int(os.getenv("FLASK_PORT", "5000"))
+
+DEBUG_MODE = os.getenv(
+    "FLASK_DEBUG", "false"
+).lower() in ("1", "true", "yes")
+
+app = Flask(__name__)
+
+
+# ============================================================
+# 2. AGENT STATE
+# ============================================================
+
+class AgentState(TypedDict, total=False):
+    query: str
+    tool_name: Optional[str]
+    tool_input: Optional[str]
+    tool_result: Optional[str]
+    tool_error: Optional[str]
+    route: Optional[str]
+    final_answer: Optional[str]
+    debug: Annotated[list[str], operator.add]
+
+
+# ============================================================
+# 3. LANGUAGE MODEL
+# ============================================================
+
+llm = ChatOllama(
+    model=MODEL,
+    base_url=OLLAMA_URL,
+    temperature=0,
+    num_predict=512
+)
+
+
+def safe_llm_invoke(messages, default=""):
+    """
+    Call the model safely.
+    Return a fallback answer if Ollama fails.
+    """
+    try:
+        response = llm.invoke(messages)
+        content = response.content
+
+        if isinstance(content, list):
+            content = " ".join(
+                item.get("text", "") if isinstance(item, dict)
+                else str(item)
+                for item in content
+            )
+
+        content = str(content).strip()
+
+        if not content:
+            logger.warning("The model returned an empty response.")
+            return default
+
+        return content
+
+    except Exception:
+        logger.exception("LLM invocation failed.")
+        return default
+
+
+# ============================================================
+# 4. SAFE CALCULATOR
+# ============================================================
+
+ALLOWED_FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "pow": math.pow,
+    "abs": abs,
+    "round": round,
+    "min": min,
+    "max": max,
+    "log": math.log,
+    "log10": math.log10,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+}
+
+ALLOWED_CONSTANTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
+
+BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+
+UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def evaluate_math_node(node):
+    """
+    Evaluate a mathematical expression using an AST allowlist.
+    Arbitrary Python code is not allowed.
+    """
+
+    if isinstance(node, ast.Expression):
+        return evaluate_math_node(node.body)
+
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            if abs(node.value) > 1e100:
+                raise ValueError("Number too large.")
+            return node.value
+
+        raise ValueError("Invalid constant.")
+
+    if isinstance(node, ast.Name):
+        if node.id in ALLOWED_CONSTANTS:
+            return ALLOWED_CONSTANTS[node.id]
+
+        raise ValueError(f"Unknown constant: {node.id}")
+
+    if isinstance(node, ast.BinOp):
+        operation = BINARY_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Operator not allowed.")
+
+        left = evaluate_math_node(node.left)
+        right = evaluate_math_node(node.right)
+
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 1000:
+                raise ValueError("Exponent too large.")
+
+        result = operation(left, right)
+
+        if isinstance(result, complex):
+            raise ValueError("Complex results are not supported.")
+
+        if isinstance(result, (int, float)):
+            if not math.isfinite(result) or abs(result) > 1e100:
+                raise ValueError("Result too large or invalid.")
+
+        return result
+
+    if isinstance(node, ast.UnaryOp):
+        operation = UNARY_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Unary operator not allowed.")
+
+        return operation(evaluate_math_node(node.operand))
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Function not allowed.")
+
+        function = ALLOWED_FUNCTIONS.get(node.func.id)
+
+        if function is None or node.keywords:
+            raise ValueError("Function not allowed.")
+
+        arguments = [
+            evaluate_math_node(argument)
+            for argument in node.args
+        ]
+
+        result = function(*arguments)
+
+        if isinstance(result, (int, float)):
+            if not math.isfinite(result):
+                raise ValueError("Result is not finite.")
+
+        return result
+
+    raise ValueError("Invalid mathematical expression.")
+
+
+def calculator_tool(expression: str) -> str:
+    """
+    Calculate an expression safely.
+    Supports:
+        12 * 8
+        sqrt(144) + 5
+        2^10
+        5²
+        5³
+        10 / 2
+    """
+
+    expression = expression.strip()
+
+    expression = (
+        expression
+        .replace("^", "**")
+        .replace("×", "*")
+        .replace("÷", "/")
+        .replace("π", "pi")
+    )
+
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*²\b",
+        r"(\1**2)",
+        expression
+    )
+
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*³\b",
+        r"(\1**3)",
+        expression
+    )
+
+    # Convert √9 to sqrt(9).
+    expression = re.sub(
+        r"√\s*(\d+(?:\.\d+)?)",
+        r"sqrt(\1)",
+        expression
+    )
+
+    if not expression or len(expression) > 250:
+        raise ValueError("Empty expression or expression too long.")
+
+    tree = ast.parse(expression, mode="eval")
+
+    result = evaluate_math_node(tree)
+
+    return str(result)
+
+
+# ============================================================
+# 5. LOCAL KNOWLEDGE BASE
+# ============================================================
+
+KNOWLEDGE_BASE = {
+    "tunisia": (
+        "Tunisia is a North African country bordering the "
+        "Mediterranean Sea. Its capital is Tunis and its "
+        "currency is the Tunisian dinar. Tunisia is known "
+        "for Carthage, the Sahara Desert and its coastline."
+    ),
+
+    "france": (
+        "France is a country in Western Europe. Its capital "
+        "is Paris. It is known for its cultural heritage, "
+        "cuisine and landmarks such as the Eiffel Tower."
+    ),
+
+    "python": (
+        "Python is a high-level programming language created "
+        "by Guido van Rossum. It emphasizes readability and "
+        "is widely used in web development, automation, "
+        "data analysis and artificial intelligence."
+    ),
+
+    "ai": (
+        "Artificial intelligence refers to computer systems "
+        "designed to perform tasks associated with human "
+        "intelligence, such as language processing, reasoning "
+        "and pattern recognition."
+    ),
+
+    "langgraph": (
+        "LangGraph is a framework for building stateful, "
+        "graph-based workflows for applications powered "
+        "by language models."
+    ),
+}
+
+
+def search_tool(query: str) -> str:
+    """
+    Search the local knowledge base.
+    This function does not perform a live Internet search.
+    """
+
+    query_lower = query.lower().strip()
+
+    for key, value in KNOWLEDGE_BASE.items():
+        if key in query_lower:
+            return value
+
+    return (
+        f"No specific local result was found for '{query}'. "
+        "The local knowledge base does not contain "
+        "enough information to answer this request."
+    )
+
+
+# ============================================================
+# 6. JSON PARSER
+# ============================================================
+
+def parse_json_object(raw: str) -> dict:
+    """
+    Parse JSON returned by the model.
+    Handles JSON wrapped in Markdown fences or extra text.
+    """
+
+    raw = raw.strip()
+
+    try:
+        result = json.loads(raw)
+
+        if isinstance(result, dict):
+            return result
+
+    except json.JSONDecodeError:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+
+    if start >= 0 and end > start:
+        try:
+            result = json.loads(raw[start:end + 1])
+
+            if isinstance(result, dict):
+                return result
+
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
+# ============================================================
+# 7. SEARCH RESULT PROCESSOR
+# ============================================================
+
+def parse_search_results(query: str, search_results: str) -> str:
+    """
+    Generate a natural answer based on local search results.
+    """
+
+    prompt = f"""
+Answer the user's question using the supplied information.
+
+Rules:
+- Be accurate, helpful and concise.
+- Respond in the same language as the user.
+- Do not invent facts that are absent from the context.
+- If the context is insufficient, explain that clearly.
+- Do not claim that you performed a live web search.
+
+User question:
+{query}
+
+Available information:
+{search_results}
+"""
+
+    return safe_llm_invoke(
+        [
+            SystemMessage(
+                content="You are a helpful and accurate AI assistant."
+            ),
+            HumanMessage(content=prompt),
+        ],
+        default=search_results
+    )
+
+
+# ============================================================
+# 8. NODE: CLASSIFY USER INPUT
+# ============================================================
+
+def classify_input(state: AgentState) -> dict:
+    """
+    Decide whether to use the calculator, local search,
+    or a direct language-model response.
+    """
+
+    query = state["query"]
+
+    debug = [
+        f'User query: "{query}"'
+    ]
+
+    prompt = f"""
+You are an AI request router.
+
+Available options:
+
+1. calculator:
+Use only for numerical calculations that can be evaluated.
+
+2. search:
+Use for factual lookup that may be answered using a
+small local knowledge base.
+
+3. direct:
+Use for conversations, explanations, programming,
+equations containing variables, and other questions.
+
+Return ONLY a valid JSON object in this format:
+{{"tool": "calculator", "input": "12 * 8"}}
+
+For search:
+{{"tool": "search", "input": "Tunisia"}}
+
+For direct:
+{{"tool": "direct", "input": null}}
+
+Calculator restrictions:
+- Only use mathematical expressions.
+- Never generate Python statements or imports.
+- Supported functions: sqrt, pow, abs, round, min, max,
+  log, log10, sin, cos, tan.
+- Use ** for exponentiation.
+- Do not solve symbolic equations using the calculator.
+
+User request:
+{query}
+"""
+
+    raw = safe_llm_invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You are a strict request classifier. "
+                    "Return valid JSON only."
+                )
+            ),
+            HumanMessage(content=prompt),
+        ],
+        default='{"tool":"direct","input":null}'
+    )
+
+    debug.append(f"Model classification: {raw[:300]}")
+
+    decision = parse_json_object(raw)
+
+    tool_name = decision.get("tool", "direct")
+    tool_input = decision.get("input")
+
+    if tool_name not in {"calculator", "search", "direct"}:
+        tool_name = "direct"
+        tool_input = None
+
+    if tool_input is not None and not isinstance(tool_input, str):
+        tool_input = str(tool_input)
+
+    if tool_name != "direct" and not tool_input:
+        tool_name = "direct"
+        tool_input = None
+
+    debug.append(f"Selected route: {tool_name}")
+
+    if tool_input:
+        debug.append(f"Prepared input: {tool_input}")
+
+    return {
+        "tool_name": None if tool_name == "direct" else tool_name,
+        "tool_input": tool_input,
+        "route": "direct" if tool_name == "direct" else None,
+        "debug": debug,
+    }
+
+
+# ============================================================
+# 9. NODE: EXECUTE TOOL
+# ============================================================
+
+def execute_tool(state: AgentState) -> dict:
+    """
+    Execute the selected tool and capture errors.
+    """
+
+    tool_name = state.get("tool_name")
+    tool_input = state.get("tool_input")
+
+    debug = [
+        f"Executing tool: {tool_name}"
+    ]
+
+    try:
+
+        if tool_name == "calculator":
+
+            if not tool_input:
+                raise ValueError(
+                    "No mathematical expression was provided."
+                )
+
+            result = calculator_tool(tool_input)
+
+        elif tool_name == "search":
+
+            if not tool_input:
+                raise ValueError(
+                    "No search query was provided."
+                )
+
+            search_results = search_tool(tool_input)
+
+            result = parse_search_results(
+                state["query"],
+                search_results
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown tool: {tool_name}"
+            )
+
+        debug.append(f"Tool result: {result[:300]}")
+
+        return {
+            "tool_result": result,
+            "tool_error": None,
+            "route": "tool",
+            "debug": debug,
+        }
+
+    except Exception as error:
+
+        logger.exception("Tool execution failed.")
+
+        debug.append(
+            f"Tool error: {type(error).__name__}: {error}"
+        )
+
+        return {
+            "tool_result": None,
+            "tool_error": str(error),
+            "route": "fallback",
+            "debug": debug,
+        }
+
+
+# ============================================================
+# 10. NODE: DIRECT LLM ANSWER / FALLBACK
+# ============================================================
+
+def llm_answer(state: AgentState) -> dict:
+    """
+    Answer directly or provide a fallback if a tool fails.
+    """
+
+    query = state["query"]
+    route = state.get("route") or "direct"
+
+    system_prompt = """
+You are a helpful AI assistant.
+
+Rules:
+- Answer in the same language as the user.
+- Be clear, useful and accurate.
+- For programming requests, provide practical explanations.
+- Never claim a tool succeeded if it failed.
+- If information is uncertain, say so.
+"""
+
+    if state.get("tool_error"):
+        system_prompt += (
+            "\nA tool failed while processing this request. "
+            "Try to answer without pretending that the tool worked."
+        )
+
+    answer = safe_llm_invoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query),
+        ],
+        default=(
+            "I cannot generate a response right now. "
+            "Please check that Ollama is running and that "
+            "the configured model is installed."
+        )
+    )
+
+    return {
+        "final_answer": answer,
+        "route": route,
+        "debug": [
+            f"LLM response generated using route: {route}"
+        ],
+    }
+
+
+# ============================================================
+# 11. NODE: FORMAT OUTPUT
+# ============================================================
+
+def format_output(state: AgentState) -> dict:
+    """
+    Select the final answer from the graph state.
+    """
+
+    if (
+        state.get("route") == "tool"
+        and state.get("tool_result")
+    ):
+        answer = state["tool_result"]
+
+    elif state.get("final_answer"):
+        answer = state["final_answer"]
+
+    else:
+        answer = "I could not process your request."
+
+    return {
+        "final_answer": answer,
+        "debug": [
+            f"Final response prepared: {len(answer)} characters"
+        ],
+    }
+
+
+# ============================================================
+# 12. LANGGRAPH ROUTING
+# ============================================================
+
+def route_after_classify(state: AgentState) -> str:
+    if state.get("tool_name"):
+        return "execute_tool"
+
+    return "llm_answer"
+
+
+def route_after_tool(state: AgentState) -> str:
+    if state.get("tool_error"):
+        return "llm_answer"
+
+    return "format_output"
+
+
+# ============================================================
+# 13. BUILD AGENT
+# ============================================================
+
+def build_agent():
+
+    graph = StateGraph(AgentState)
+
+    graph.add_node(
+        "classify_input",
+        classify_input
+    )
+
+    graph.add_node(
+        "execute_tool",
+        execute_tool
+    )
+
+    graph.add_node(
+        "llm_answer",
+        llm_answer
+    )
+
+    graph.add_node(
+        "format_output",
+        format_output
+    )
+
+    graph.add_edge(
+        START,
+        "classify_input"
+    )
+
+    graph.add_conditional_edges(
+        "classify_input",
+        route_after_classify
+    )
+
+    graph.add_conditional_edges(
+        "execute_tool",
+        route_after_tool
+    )
+
+    graph.add_edge(
+        "llm_answer",
+        "format_output"
+    )
+
+    graph.add_edge(
+        "format_output",
+        END
+    )
+
+    return graph.compile()
+
+
+# Build the agent once at startup.
+agent = build_agent()
+
+
+# ============================================================
+# 14. WEB INTERFACE
+# ============================================================
+
+HTML_PAGE = r"""
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>AI Assistant</title>
+
+<style>
+:root {
+    --background: #0b1020;
+    --panel: #121a2e;
+    --border: #273653;
+    --accent: #6ea8fe;
+    --text: #eef3ff;
+    --muted: #a9b7d0;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    padding: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--background);
+    color: var(--text);
+    font-family: Arial, sans-serif;
+}
+
+main {
+    width: min(780px, 100%);
+}
+
+h1 {
+    margin-bottom: 6px;
+    font-size: 36px;
+}
+
+.subtitle {
+    color: var(--muted);
+    margin-bottom: 24px;
+}
+
+.panel {
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: var(--panel);
+}
+
+#chat {
+    min-height: 260px;
+    max-height: 50vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.message {
+    padding: 12px 15px;
+    border-radius: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.user {
+    align-self: flex-end;
+    max-width: 90%;
+    background: #1d3762;
+}
+
+.assistant {
+    align-self: stretch;
+    background: #19243a;
+}
+
+form {
+    display: flex;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+input {
+    flex: 1;
+    min-width: 0;
+    padding: 13px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #0b1222;
+    color: white;
+    font-size: 16px;
+}
+
+button {
+    padding: 12px 20px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #07101f;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.status {
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.metadata {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: -6px;
+}
+
+@media (max-width: 520px) {
+    body {
+        padding: 12px;
+    }
+
+    .panel {
+        padding: 12px;
+    }
+
+    form {
+        flex-direction: column;
+    }
+
+    button {
+        width: 100%;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<main>
+
+    <h1>AI Assistant</h1>
+
+    <p class="subtitle">
+        Flask + LangGraph + Ollama
+    </p>
+
+    <section class="panel">
+
+        <div id="chat" aria-live="polite">
+            <div class="message assistant">
+                Bonjour ! Comment puis-je vous aider ?
+            </div>
+        </div>
+
+        <form id="chat-form">
+
+            <input
+                id="message"
+                type="text"
+                placeholder="Écris ton message..."
+                autocomplete="off"
+                required
+            >
+
+            <button id="send-button" type="submit">
+                Envoyer
+            </button>
+
+        </form>
+
+        <div class="status" id="status">
+            Vérification du modèle...
+        </div>
+
+    </section>
+
+</main>
+
+<script>
+const form = document.getElementById("chat-form");
+const input = document.getElementById("message");
+const chat = document.getElementById("chat");
+const button = document.getElementById("send-button");
+const statusBox = document.getElementById("status");
+
+function addMessage(text, role, metadata = "") {
+    const message = document.createElement("div");
+
+    message.className = "message " + role;
+    message.textContent = text;
+
+    chat.appendChild(message);
+
+    if (metadata) {
+        const info = document.createElement("div");
+
+        info.className = "metadata";
+        info.textContent = metadata;
+
+        chat.appendChild(info);
+    }
+
+    chat.scrollTop = chat.scrollHeight;
+}
+
+async function checkHealth() {
+    try {
+        const response = await fetch("/health");
+        const data = await response.json();
+
+        if (data.model_available) {
+            statusBox.textContent =
+                "Ollama connecté · Modèle : " +
+                data.configured_model;
+        } else {
+            statusBox.textContent =
+                "Ollama accessible, mais modèle absent. " +
+                (data.hint || "");
+        }
+    } catch (error) {
+        statusBox.textContent =
+            "Impossible de vérifier Ollama.";
+    }
+}
+
+form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const message = input.value.trim();
+
+    if (!message) {
+        return;
+    }
+
+    addMessage(message, "user");
+
+    input.value = "";
+    button.disabled = true;
+    statusBox.textContent = "Réponse en cours...";
+
+    try {
+        const response = await fetch("/chat", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                message: message
+            })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || "Erreur serveur"
+            );
+        }
+
+        const metadata =
+            "Route : " + (data.route || "unknown") +
+            (data.tool ? " · Outil : " + data.tool : "");
+
+        addMessage(
+            data.answer || "Aucune réponse.",
+            "assistant",
+            metadata
+        );
+
+        statusBox.textContent = "Prêt.";
+
+    } catch (error) {
+
+        addMessage(
+            "Erreur : " + error.message,
+            "assistant"
+        );
+
+        statusBox.textContent =
+            "Vérifie Flask et Ollama.";
+
+    } finally {
+
+        button.disabled = false;
+        input.focus();
+    }
+});
+
+checkHealth();
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# 15. FLASK ROUTES
+# ============================================================
+
+@app.get("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.post("/chat")
+def chat():
+
+    if not request.is_json:
+        return jsonify({
+            "error": "La requête doit être au format JSON."
+        }), 415
+
+    data = request.get_json(silent=True) or {}
+
+    message = data.get("message", "")
+
+    if not isinstance(message, str):
+        return jsonify({
+            "error": "Le champ message doit être une chaîne."
+        }), 400
+
+    query = message.strip()
+
+    if not query:
+        return jsonify({
+            "error": "Le message est vide."
+        }), 400
+
+    if len(query) > 10000:
+        return jsonify({
+            "error": "Message trop long. Maximum : 10 000 caractères."
+        }), 413
+
+    try:
+
+        result = agent.invoke({
+            "query": query,
+            "debug": [],
+            "tool_name": None,
+            "tool_input": None,
+            "tool_result": None,
+            "tool_error": None,
+            "route": None,
+            "final_answer": None,
+        })
+
+        return jsonify({
+            "answer": result.get(
+                "final_answer",
+                "Aucune réponse générée."
+            ),
+            "route": result.get("route") or "unknown",
+            "tool": result.get("tool_name"),
+            "debug": result.get("debug", []),
+        })
+
+    except Exception:
+
+        logger.exception("Error processing chat request.")
+
+        return jsonify({
+            "error": (
+                "Une erreur interne est survenue. "
+                "Vérifie les logs du serveur."
+            )
+        }), 500
+
+
+@app.get("/health")
+def health():
+    """
+    Check Ollama availability and installed models.
+    """
+
+    try:
+
+        response = requests.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=3
+        )
+
+        response.raise_for_status()
+
+        models = [
+            item.get("name", "")
+            for item in response.json().get("models", [])
+        ]
+
+        available = any(
+            name == MODEL or name.startswith(MODEL + ":")
+            for name in models
+        )
+
+        return jsonify({
+            "status": "ok" if available else "warning",
+            "ollama_reachable": True,
+            "configured_model": MODEL,
+            "model_available": available,
+            "models": models,
+            "hint": (
+                None if available
+                else f"Installe le modèle avec : ollama pull {MODEL}"
+            ),
+        }), 200
+
+    except requests.RequestException:
+
+        logger.exception("Ollama is not reachable.")
+
+        return jsonify({
+            "status": "error",
+            "ollama_reachable": False,
+            "configured_model": MODEL,
+            "message": (
+                "Ollama est inaccessible. "
+                "Vérifie qu'il est installé et lancé."
+            ),
+        }), 503
+
+    except (ValueError, KeyError):
+
+        logger.exception("Invalid Ollama response.")
+
+        return jsonify({
+            "status": "error",
+            "message": "Réponse invalide du serveur Ollama."
+        }), 503
+
+
+# ============================================================
+# 16. APPLICATION ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    logger.info("Starting AI Agent...")
+    logger.info("Ollama URL: %s", OLLAMA_URL)
+    logger.info("Configured model: %s", MODEL)
+
+    app.run(
+        host=HOST,
+        port=PORT,
+        debug=DEBUG_MODE
+    )
